@@ -133,56 +133,70 @@ def findDNS(pkt):
 # Detects potential DoS attacks by monitoring the number of incoming packets.
 # If the packet rate exceeds a threshold, it sends an alert to the server.
 def detectDos():
-    packet_count = 0
-    packet_rate_history = []
-    threshold = 10000  # Initial threshold (adjust based on your network)
+    syn_packet_count = 0
+    syn_packet_rate_history = []
     source_ip_count = defaultdict(int)  # Track source IPs
+    alert_cooldown = 0  # Cooldown period to avoid duplicate alerts
 
     while True:
         try:
-            start_time = time.time()  # Use time.time() to get the current time
+            start_time = time.time()  # Get the current time
             # Sniff packets for 1 second
             packets = sniff(timeout=1, prn=lambda x: None)
-            packet_count = len(packets)
-
-            # Track source IPs
+            
+            # Count SYN packets and track source IPs
             for packet in packets:
-                if IP in packet:
-                    source_ip_count[packet[IP].src] += 1
+                if TCP in packet and packet[TCP].flags == "S":  # Check for SYN flag
+                    syn_packet_count += 1
+                    if IP in packet:
+                        source_ip_count[packet[IP].src] += 1
 
-            # Calculate packet rate (packets per second)
-            packet_rate = packet_count / (time.time() - start_time)  # Use time.time() here
+            # Calculate SYN packet rate (packets per second)
+            syn_packet_rate = syn_packet_count / (time.time() - start_time)
 
-            # Update packet rate history (last 10 seconds)
-            packet_rate_history.append(packet_rate)
-            if len(packet_rate_history) > 10:
-                packet_rate_history.pop(0)
+            # Update SYN packet rate history (last 10 seconds)
+            syn_packet_rate_history.append(syn_packet_rate)
+            if len(syn_packet_rate_history) > 10:
+                syn_packet_rate_history.pop(0)
 
             # Calculate dynamic threshold (average of last 10 seconds + buffer)
-            dynamic_threshold = sum(packet_rate_history) / len(packet_rate_history) * 1.5
+            dynamic_threshold = sum(syn_packet_rate_history) / len(syn_packet_rate_history) * 1.5
 
-            # If packet rate exceeds the dynamic threshold, send an alert
-            if packet_rate > dynamic_threshold:
+            # Check if the SYN packet rate exceeds the dynamic threshold
+            if syn_packet_rate > dynamic_threshold:
                 # Identify top source IPs
                 top_ips = sorted(source_ip_count.items(), key=lambda x: x[1], reverse=True)[:5]
                 top_ips_str = ", ".join([f"{ip}: {count}" for ip, count in top_ips])
 
-                # Send alert to EDR server
-                alert_message = (
-                    f'[ALERT] Potential DoS attack detected!\n'
-                    f'Packet rate: {packet_rate:.2f} packets/sec\n'
-                    f'Top source IPs: {top_ips_str}\n\n'
-                )
-                clientSocket.send(alert_message.encode())
+                # Check if the attack is sustained (e.g., over 3 consecutive intervals)
+                if len(syn_packet_rate_history) >= 3 and all(rate > dynamic_threshold for rate in syn_packet_rate_history[-3:]):
+                    # Check if the cooldown period has passed
+                    if alert_cooldown <= 0:
+                        # Send alert to EDR server
+                        alert_message = (
+                            f'[ALERT] Potential SYN Flood DoS attack detected!\n'
+                            f'SYN packet rate: {syn_packet_rate:.2f} packets/sec\n'
+                            f'Top source IPs: {top_ips_str}\n\n'
+                        )
+                        clientSocket.send(alert_message.encode())
 
-                # Reset counters
+                        # Set cooldown period (e.g., 10 seconds)
+                        alert_cooldown = 10
+
+            # Decrement cooldown timer
+            if alert_cooldown > 0:
+                alert_cooldown -= 1
+
+            # Reset counters if no attack is detected
+            if syn_packet_rate <= dynamic_threshold:
                 source_ip_count.clear()
-                packet_rate_history.clear()
+                syn_packet_count = 0
 
         except Exception as e:
             print(f"[ERROR] DoS detection failed: {e}")
-        sleep(1)
+        sleep(1)   
         
+             
 # Register signal handler for graceful termination
 signal.signal(signal.SIGINT, signal_handler)
 
