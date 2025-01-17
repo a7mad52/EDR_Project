@@ -13,6 +13,7 @@ from scapy.layers.dns import DNS, DNSQR  # Import DNS and DNSQR from scapy.layer
 import signal
 import sys
 from collections import defaultdict
+from scapy.layers.inet import TCP, IP
 
 TAB_1 = '\t'
 TAB_2 = '\t\t'
@@ -195,8 +196,8 @@ def detectDos():
         except Exception as e:
             print(f"[ERROR] DoS detection failed: {e}")
         sleep(1)   
-        
-             
+
+
 # Register signal handler for graceful termination
 signal.signal(signal.SIGINT, signal_handler)
 
