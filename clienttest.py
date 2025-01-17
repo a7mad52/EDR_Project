@@ -6,12 +6,13 @@ from os import path, remove
 from platform import system
 from subprocess import check_output, run
 from threading import Thread
-from time import sleep
+from time import sleep, time
 from bs4 import BeautifulSoup
 from scapy.all import *
 from scapy.layers.dns import DNS, DNSQR  # Import DNS and DNSQR from scapy.layers.dns
 import signal
 import sys
+from collections import defaultdict
 
 TAB_1 = '\t'
 TAB_2 = '\t\t'
@@ -133,22 +134,55 @@ def findDNS(pkt):
 # If the packet rate exceeds a threshold, it sends an alert to the server.
 def detectDos():
     packet_count = 0
-    threshold = 10000  # Adjust this threshold based on your network's normal traffic
+    packet_rate_history = []
+    threshold = 10000  # Initial threshold (adjust based on your network)
+    source_ip_count = defaultdict(int)  # Track source IPs
+
     while True:
         try:
+            start_time = time.time()  # Use time.time() to get the current time
             # Sniff packets for 1 second
-            sniff(timeout=1, prn=lambda x: None)
-            packet_count += 1
+            packets = sniff(timeout=1, prn=lambda x: None)
+            packet_count = len(packets)
 
-            # If packet count exceeds the threshold, send an alert
-            if packet_count > threshold:
-                clientSocket.send(
-                    f'[ALERT] Potential DoS attack detected! Packet count: {packet_count}\n\n'.encode())
-                packet_count = 0  # Reset the counter
+            # Track source IPs
+            for packet in packets:
+                if IP in packet:
+                    source_ip_count[packet[IP].src] += 1
+
+            # Calculate packet rate (packets per second)
+            packet_rate = packet_count / (time.time() - start_time)  # Use time.time() here
+
+            # Update packet rate history (last 10 seconds)
+            packet_rate_history.append(packet_rate)
+            if len(packet_rate_history) > 10:
+                packet_rate_history.pop(0)
+
+            # Calculate dynamic threshold (average of last 10 seconds + buffer)
+            dynamic_threshold = sum(packet_rate_history) / len(packet_rate_history) * 1.5
+
+            # If packet rate exceeds the dynamic threshold, send an alert
+            if packet_rate > dynamic_threshold:
+                # Identify top source IPs
+                top_ips = sorted(source_ip_count.items(), key=lambda x: x[1], reverse=True)[:5]
+                top_ips_str = ", ".join([f"{ip}: {count}" for ip, count in top_ips])
+
+                # Send alert to EDR server
+                alert_message = (
+                    f'[ALERT] Potential DoS attack detected!\n'
+                    f'Packet rate: {packet_rate:.2f} packets/sec\n'
+                    f'Top source IPs: {top_ips_str}\n\n'
+                )
+                clientSocket.send(alert_message.encode())
+
+                # Reset counters
+                source_ip_count.clear()
+                packet_rate_history.clear()
+
         except Exception as e:
             print(f"[ERROR] DoS detection failed: {e}")
         sleep(1)
-
+        
 # Register signal handler for graceful termination
 signal.signal(signal.SIGINT, signal_handler)
 
