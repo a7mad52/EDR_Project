@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 """ Description: This is the client's code. """
 import socket
 import urllib.request
