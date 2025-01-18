@@ -6,13 +6,14 @@ from os import path, remove
 from platform import system
 from subprocess import check_output, run
 from threading import Thread
-from time import sleep
+from time import sleep, time
 from bs4 import BeautifulSoup
 from scapy.all import *
 from scapy.layers.dns import DNS, DNSQR  # Import DNS and DNSQR from scapy.layers.dns
 import signal
 import sys
-
+from collections import defaultdict
+from scapy.layers.inet import TCP, IP
 
 TAB_1 = '\t'
 TAB_2 = '\t\t'
@@ -48,54 +49,6 @@ def main():
         print(welcomeMessage.decode())
     except socket.error as error:
         exit(f'[ERROR] Connecting to the server failed:\n\033[31m{error}\033[0m')
-
-# MITM:
-# Checks for duplications in ARP table in both Linux and Windows.
-# Iterates through the MAC addresses in the ARP table, adding them to a list.
-# If a duplication occurs - the value of the MAC in the dictionary will rise by 1.
-# For every MAC key that has a value of more than 1, it will send a warning message to the server.
-# The scan happens every sleep(x seconds) - modify to your liking.
-def MITM():
-    while True:
-        macList = []
-        macDict = {}
-        try:
-            if runningOS == "Windows":
-                ARPmacs = check_output("arp -a", shell=True).decode()
-
-                for line in ARPmacs.splitlines():
-                    if "dynamic" in line:
-                        macList.append(line[24:41])
-
-                for MAC in macList:
-                    if MAC in macDict:
-                        macDict[MAC] = macDict[MAC] + 1
-                    else:
-                        macDict[MAC] = 1
-
-                for MAC, value in macDict.items():
-                    if value >= 2:
-                        clientSocket.send(
-                            f'Found MAC address duplication. Possible Man in the Middle Attack!\n({MAC}\n\n'.encode())
-
-            elif runningOS == "Linux":
-                ARPmacs = check_output(
-                    "arp | awk '{print $3}' | grep -v HW | grep -v eth0", shell=True).decode()
-                for line in ARPmacs.splitlines():
-                    macList.append(line)
-
-                for MAC in macList:
-                    if MAC in macDict:
-                        macDict[MAC] = macDict[MAC] + 1
-                    else:
-                        macDict[MAC] = 1
-                for MAC, value in macDict.items():
-                    if value >= 2:
-                        clientSocket.send(
-                            f'Found MAC address duplication. Possible Man in the Middle Attack!\n({MAC}\n\n'.encode())
-        except Exception as e:
-            print(f"[ERROR] MITM detection failed: {e}")
-        sleep(15)
 
 # restricted_Sites_List_Maker:
 # Creates a list of website names that will be used as arguments for the DNS sniffer.
@@ -173,9 +126,77 @@ def findDNS(pkt):
             for site in restrictedSitesList:
                 if site in url:
                     clientSocket.send(
-                        f'[ALERT] Entered a restricted website:\n{site}\n\n'.encode())
+                        f'[ALERT] Entered a restricted website:{site}\n\n'.encode())
     except Exception as e:
         print(f"[ERROR] DNS sniffing failed: {e}")
+
+# detectDos:
+# Detects potential DoS attacks by monitoring the number of incoming packets.
+# If the packet rate exceeds a threshold, it sends an alert to the server.
+def detectDos():
+    syn_packet_count = 0
+    syn_packet_rate_history = []
+    source_ip_count = defaultdict(int)  # Track source IPs
+    alert_cooldown = 0  # Cooldown period to avoid duplicate alerts
+    dynamic_threshold = 1000  # Initial threshold (adjust based on your network)
+
+    while True:
+        try:
+            start_time = time.time()  # Get the current time
+            # Sniff packets for 1 second
+            packets = sniff(timeout=1, prn=lambda x: None)
+            
+            # Count SYN packets and track source IPs
+            for packet in packets:
+                if TCP in packet and packet[TCP].flags == "S":  # Check for SYN flag
+                    syn_packet_count += 1
+                    if IP in packet:
+                        source_ip_count[packet[IP].src] += 1
+
+            # Calculate SYN packet rate (packets per second)
+            syn_packet_rate = syn_packet_count / (time.time() - start_time)
+
+            # Update SYN packet rate history (last 10 seconds)
+            syn_packet_rate_history.append(syn_packet_rate)
+            if len(syn_packet_rate_history) > 10:
+                syn_packet_rate_history.pop(0)
+
+            # Calculate dynamic threshold (average of last 10 seconds + buffer)
+            dynamic_threshold = sum(syn_packet_rate_history) / len(syn_packet_rate_history) * 1.5
+
+            # Check if the SYN packet rate exceeds the dynamic threshold
+            if syn_packet_rate > dynamic_threshold:
+                # Identify top source IPs
+                top_ips = sorted(source_ip_count.items(), key=lambda x: x[1], reverse=True)[:5]
+                top_ips_str = ", ".join([f"{ip}: {count}" for ip, count in top_ips])
+
+                # Check if the attack is sustained (e.g., over 3 consecutive intervals)
+                if len(syn_packet_rate_history) >= 3 and all(rate > dynamic_threshold for rate in syn_packet_rate_history[-3:]):
+                    # Check if the cooldown period has passed
+                    if alert_cooldown <= 0:
+                        # Send alert to EDR server
+                        alert_message = (
+                            f'[ALERT] Potential SYN Flood DoS attack detected!\n'
+                            f'SYN packet rate: {syn_packet_rate:.2f} packets/sec\n'
+                            f'Top source IPs: {top_ips_str}\n\n'
+                        )
+                        clientSocket.send(alert_message.encode())
+
+                        # Set cooldown period (e.g., 10 seconds)
+                        alert_cooldown = 10
+
+            # Decrement cooldown timer
+            if alert_cooldown > 0:
+                alert_cooldown -= 1
+
+            # Reset counters if no attack is detected
+            if syn_packet_rate <= dynamic_threshold:
+                source_ip_count.clear()
+                syn_packet_count = 0
+
+        except Exception as e:
+            print(f"[ERROR] DoS detection failed: {e}")
+        sleep(1)
 
 # Register signal handler for graceful termination
 signal.signal(signal.SIGINT, signal_handler)
@@ -183,5 +204,5 @@ signal.signal(signal.SIGINT, signal_handler)
 if __name__ == '__main__':
     main()
     Thread(target=restricted_Sites_List_Maker).start()
-    Thread(target=MITM).start()
-    Thread(target=sniff, kwargs={"prn": findDNS}).start()
+    Thread(target=lambda: sniff(prn=findDNS)).start()
+    Thread(target=detectDos).start()
