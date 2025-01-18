@@ -1,14 +1,19 @@
 #!/usr/bin/python3
 '''
 ==================================================================================================================================
-Course:
-   Cyber Security, May, 2020
 Project Name:
-   #3 - Python - Endpoint Detection and Response.
-Objective:
-   Create an Endpoint Detection and Response System (EDR)
-Student Name:
-   Robert Jonny Tiger.
+   EDR Server - Endpoint Detection and Response System
+
+Developers:
+   Ahmad Doulat
+   Mohammad Rousan
+   Ahmad Delaa
+
+Description:
+   This script is part of an Endpoint Detection and Response (EDR) system.
+   It acts as the server component, handling client connections, monitoring
+   for potential threats, and logging activities in real-time.
+
 ==================================================================================================================================
 '''
 import socket
@@ -22,37 +27,32 @@ TAB_1 = '\t'
 TAB_2 = '\t\t'
 
 PROJECTPATH = Path(__file__).resolve().parent
-HOST = '192.168.1.153'
-PORT = 1111
+HOST = '192.168.1.153'  # Server IP
+PORT = 1111  # Server port
 
-# Socket object.
+# Socket object
 serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-connectionsCount = 0  # How many clients are connected to the server.
-activeAddressesList = []  # List of connected addresses.
-openClientSocketsList = []  # List of open socket connections.
+connectionsCount = 0  # Number of connected clients
+activeAddressesList = []  # List of connected addresses
+openClientSocketsList = []  # List of open socket connections
 
-# apache2Start:
-# Checks if apache2 is installed. If not, exits the code with a message.
-# Starts apache2 server.
-# Copies the local restricted_sites.html to the actual html folder in /var/www/html where apache2 is running from.
-# Server admin edits the file inside the /var/www/html to update the restricted sites list.
 def apache2Start():
+    """Start Apache2 server and ensure restricted_sites.html is accessible."""
     try:
         apache2InstallStatus = check_output(
             "dpkg --get-selections | grep apache2-bin | awk '{print $2}'", shell=True)
         if apache2InstallStatus:
             run("service apache2 start", shell=True)
             try:
-                response = urllib.request.urlopen(
-                    'http://192.168.1.153/restricted_sites.html')
-                while response.status != 200:
+                response = urllib.request.urlopen(f'http://{HOST}/restricted_sites.html')
+                if response.status != 200:
                     run('service apache2 restart', shell=True)
                     sleep(5)
             except urllib.error.HTTPError as e:
                 print(f"[ERROR] HTTP Error {e.code}: {e.reason}")
                 run('service apache2 restart', shell=True)
-                print("[INFO] Restarting Apache2 service. Please ensure restricted_sites.html exists in /var/www/html.")
+                print("[INFO] Restarting Apache2 service. Ensure restricted_sites.html exists in /var/www/html.")
             except Exception as e:
                 print(f"[ERROR] Unexpected error: {e}")
         else:
@@ -63,13 +63,68 @@ def apache2Start():
     print('[INFO] Apache2 Server Started (http://localhost:80)')
     print('[INFO] restricted_sites.html copied to /var/www/html.\nEdit the file inside /var/www/html to add or remove restricted sites for clients.')
 
-# main:
-# Binds socket to ((HOST, PORT)), listening to connections, accepting new connections, sets a format for connName.
-# Sends welcome message to new clients, appends new client's socket objects and connName to the lists.
-# Starts 2 threads: One for handling clients and the other for checking connections with clients.
+def handleClient(conn, connName):
+    """Handle client connections and process incoming data."""
+    while True:
+        try:
+            data = conn.recv(4096).decode()
+            if not data:
+                break
+
+            # Process the received data
+            if "restricted" in data:
+                timestamp = check_output("date -u +'%d/%m/%Y %H:%M'", shell=True).decode().rstrip()
+                log_entry = f"[{timestamp}]{TAB_1}\n_{connName}:\n+{data}"
+                print(f'[INFO] Restricted site accessed by {connName}.')
+            elif "DoS" in data:
+                timestamp = check_output("date -u +'%d/%m/%Y %H:%M'", shell=True).decode().rstrip()
+                log_entry = f"[{timestamp}]{TAB_1}\n_{connName}:\n+{data}"
+                print(f'[INFO] Potential DoS attack detected from {connName}.')
+
+            # Broadcast the log entry to all connected clients (Log Viewers)
+            for client in openClientSocketsList:
+                try:
+                    client.send(log_entry.encode())
+                except:
+                    print(f'[INFO] Client {connName} disconnected.')
+                    openClientSocketsList.remove(client)
+                    activeAddressesList.remove(connName)
+                    global connectionsCount
+                    connectionsCount -= 1
+
+        except Exception as e:
+            print(f"[ERROR] Error handling client {connName}: {e}")
+            break
+
+    conn.close()
+    openClientSocketsList.remove(conn)
+    activeAddressesList.remove(connName)
+    connectionsCount -= 1
+    print(f'[INFO] Client {connName} disconnected. Active connections: {connectionsCount}')
+
+def checkConnections():
+    """Check active client connections."""
+    while True:
+        global connectionsCount
+        if len(openClientSocketsList) != 0:
+            for x, currentSocket in enumerate(openClientSocketsList):
+                try:
+                    currentSocket.send(' '.encode())  # Ping the client to check connection
+                except:
+                    print(f'[INFO] Client {x} Disconnected!')
+                    del openClientSocketsList[x], activeAddressesList[x]
+                    connectionsCount -= 1
+                    print(f'[INFO] Number of Active Connections: {connectionsCount}')
+                    if connectionsCount > 0:
+                        print('[INFO] Active addresses connected:')
+                        for index, value in enumerate(activeAddressesList):
+                            print(f'{TAB_1}{index}.{TAB_1}{value}')
+        sleep(30)
+
 def main():
+    """Main server function to handle client connections."""
     try:
-        serverSocket.bind((HOST, PORT))  # Bind the socket.
+        serverSocket.bind((HOST, PORT))  # Bind the socket
         print(f'[INFO] Server address bound to self ({HOST})')
     except socket.error as error:
         exit(f'[ERROR] Error in Binding the Server:\n\033[31m{error}\033[0m')
@@ -77,7 +132,7 @@ def main():
     print(f'[INFO] Listening on port {PORT}... (Waiting for connections)')
     serverSocket.listen(50)
 
-    # Close any previous connections if the server restarts:
+    # Close any previous connections if the server restarts
     for clientSocket in openClientSocketsList:
         clientSocket.close()
     del openClientSocketsList[:], activeAddressesList[:]
@@ -86,7 +141,7 @@ def main():
         try:
             conn, (address, port) = serverSocket.accept()
             openClientSocketsList.append(conn)
-            connName = '{}:{}'.format(address, port)
+            connName = f'{address}:{port}'
             print(f'[INFO] {connName} Connected!')
 
             welcomeMessage = f'Successfully connected to EDR Server at {HOST}:{PORT}'
@@ -104,49 +159,6 @@ def main():
             print(f'[ERROR] Accepting Connection:\n\033[31m{acceptError}\033[0m')
             continue
 
-# handleClient(conn, connName):
-# Main function to receive data from all clients.
-# Handles client connections using args from main.
-def handleClient(conn, connName):
-    while True:
-        try:
-            data = conn.recv(4096).decode()
-            if "MAC" in data:
-                timestamp = check_output("date -u +'%d/%m/%Y %H:%M'", shell=True).decode().rstrip()
-                print('Possible Man in the Middle attack. Check MitM Logger.log')
-                with open(f"{PROJECTPATH}/MitMLog.log", "a+") as MitMLog:
-                    MitMLog.write(f"[{timestamp}{TAB_1}\n_{connName}\n+{data}")
-
-            if "restricted" in data:
-                timestamp = check_output("date -u +'%d/%m/%Y %H:%M'", shell=True).decode().rstrip()
-                print(f'Someone entered a restricted site. Check Restricted Sites Logger.log')
-                with open(f'{PROJECTPATH}/Restricted Sites Logger.log', 'a+') as restrictedLog:
-                    restrictedLog.write(f"[{timestamp}{TAB_1}\n_{connName}:\n+{data}")
-        except Exception as e:
-            print(f"[ERROR] Error handling client {connName}: {e}")
-            break
-
-# checkConnections:
-# Checks what clients are alive by iterating through every client socket object and trying to send a whitespace string.
-def checkConnections():
-    while True:
-        global connectionsCount
-        if len(openClientSocketsList) != 0:
-            for x, currentSocket in enumerate(openClientSocketsList):
-                try:
-                    currentSocket.send(' '.encode())
-                except:
-                    print(f'[INFO] Client {x} Disconnected!')
-                    del openClientSocketsList[x], activeAddressesList[x]
-                    connectionsCount -= 1
-                    print(f'[INFO] Number of Active Connections: {connectionsCount}')
-                    if connectionsCount > 0:
-                        print('[INFO] Active addresses connected:')
-                        for index, value in enumerate(activeAddressesList):
-                            print(f'{TAB_1}{index}.{TAB_1}{value}')
-        sleep(30)
-
-# Start of the Script:
 if __name__ == '__main__':
     apache2Start()
     main()
